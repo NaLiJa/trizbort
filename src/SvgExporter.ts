@@ -1,6 +1,7 @@
 import { Map, Box, Room, Note, Block, Connector } from "./models";
-import { Direction, LineStyle, RoomShape } from "./enums";
+import { Direction, LineStyle, RoomShape, ConnectorType } from "./enums";
 import { MarkdownParser, TextSegment } from "./util/MarkdownParser";
+import { DrawContext } from "./drawing/drawContext";
 
 //
 // The SvgExporter exports the map to an SVG file.
@@ -141,6 +142,20 @@ export class SvgExporter {
       points.push({ x: conn.endX, y: conn.endY });
     }
 
+    // A curve can bulge outside its end points; its control points bound it.
+    if (conn.isCurve && points.length == 2) {
+      const dist = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y) * this.map.settings.connector.curveStrength
+        + this.map.settings.connector.stalk;
+      if (conn.dockStart) {
+        const v = Direction.toCardinalVector(conn.startDir);
+        points.push({ x: points[0].x + v.x * dist, y: points[0].y + v.y * dist });
+      }
+      if (conn.dockEnd) {
+        const v = Direction.toCardinalVector(conn.endDir);
+        points.push({ x: points[1].x + v.x * dist, y: points[1].y + v.y * dist });
+      }
+    }
+
     return points;
   }
 
@@ -200,6 +215,43 @@ export class SvgExporter {
   private lineStyleToDashArray(style: LineStyle): string {
     const arr = LineStyle.toArray(style);
     return arr.length > 0 ? arr.join(',') : 'none';
+  }
+
+  //
+  // Hand-drawn style: run the same DrawContext the editor uses, but record its
+  // moveTo/quadraticCurveTo calls as SVG path data instead of drawing on a canvas.
+  // Seeded with the element's id, like the editor, so the wobble is stable.
+  //
+  private get handdrawn(): boolean {
+    return !!this.map.settings.basic.handdrawn;
+  }
+
+  private hdPath(seed: number, x0: number, y0: number, draw: (dc: DrawContext) => void): string {
+    // DrawContext continues from the canvas's current point; an SVG path must start with M.
+    const d: string[] = [`M ${x0} ${y0}`];
+    const recorder = {
+      moveTo: (x: number, y: number) => d.push(`M ${x} ${y}`),
+      quadraticCurveTo: (cx: number, cy: number, x: number, y: number) => d.push(`Q ${cx} ${cy} ${x} ${y}`),
+    };
+    const dc = new DrawContext(recorder as any);
+    dc.seed(seed);
+    draw(dc);
+    return d.join(' ');
+  }
+
+  // Outline of a box: hand-drawn when the map asks for it, otherwise the exact shape.
+  private getOutlinePath(box: Box): string {
+    if (!this.handdrawn) return this.getShapePath(box);
+    const { x, y, width: w, height: h } = box;
+    const r = Math.min(box.rounding || 0, w / 4, h / 4);
+    const start = box.shape == RoomShape.Ellipse ? [x + w, y + h / 2] : box.shape == RoomShape.Octagon ? [x, y + h * 0.25] : [x + r, y];
+    return this.hdPath(box.id, start[0], start[1], (dc) => {
+      switch (box.shape) {
+        case RoomShape.Ellipse: dc.hdEllipse(x + w / 2, y + h / 2, w / 2, h / 2); break;
+        case RoomShape.Octagon: dc.hdOctagon(x, y, w, h); break;
+        default: dc.hdRoundedRect(x, y, w, h, r);
+      }
+    });
   }
 
   //
@@ -279,6 +331,86 @@ export class SvgExporter {
   }
 
   //
+  // Estimate the width of a text in pixels. SVG output has no canvas to
+  // measure with, so use average glyph widths (as a fraction of the font size)
+  // for a proportional sans-serif font.
+  //
+  private textWidth(text: string, fontSize: number, bold: boolean = false): number {
+    let w = 0;
+    for (const ch of text) {
+      if ("iljI.,:;'!|".includes(ch)) w += 0.28;
+      else if ("ftr()[] -\"".includes(ch)) w += 0.36;
+      else if ("mwMW@".includes(ch)) w += 0.85;
+      else if (ch >= 'A' && ch <= 'Z') w += 0.66;
+      else w += 0.54;
+    }
+    // danielbd (the hand-drawn style's font) runs wider than a regular sans-serif
+    const fontFactor = this.map.settings.basic.fontFamily.includes('danielbd') ? 1.25 : 1;
+    return w * fontSize * fontFactor * (bold ? 1.08 : 1);
+  }
+
+  //
+  // Word-wrap text (with markdown) into lines no wider than maxWidth,
+  // respecting explicit line breaks. Mirrors Canvas.drawText.
+  //
+  private wrapText(text: string, maxWidth: number, fontSize: number): TextSegment[][] {
+    if (maxWidth < 50) maxWidth = 50;
+    const lines: TextSegment[][] = [];
+    for (const paragraph of text.split('\n')) {
+      if (paragraph.trim() === '') {
+        lines.push([{ text: '', bold: false, italic: false }]);
+        continue;
+      }
+      let line: TextSegment[] = [];
+      let width = 0;
+      for (const segment of MarkdownParser.parse(paragraph)) {
+        const words = segment.text.split(' ');
+        for (let i = 0; i < words.length; i++) {
+          const word = i < words.length - 1 ? words[i] + ' ' : words[i];
+          const ww = this.textWidth(word.trimEnd(), fontSize, segment.bold);
+          if (width + ww > maxWidth && line.length > 0) {
+            lines.push(line);
+            line = [];
+            width = 0;
+          }
+          const last = line[line.length - 1];
+          if (last && last.bold === segment.bold && last.italic === segment.italic) {
+            last.text += word;
+          } else {
+            line.push({ text: word, bold: segment.bold, italic: segment.italic });
+          }
+          width += this.textWidth(word, fontSize, segment.bold);
+        }
+      }
+      if (line.length > 0) lines.push(line);
+    }
+    // Remove trailing spaces at line ends.
+    lines.forEach(l => { if (l.length) l[l.length - 1].text = l[l.length - 1].text.trimEnd(); });
+    return lines;
+  }
+
+  //
+  // Render word-wrapped text (with markdown) centred on (cx, cy).
+  //
+  private renderWrappedText(text: string, cx: number, cy: number, maxWidth: number, fontSize: number,
+                            fontFamily: string, color: string): string {
+    const lines = this.wrapText(text, maxWidth, fontSize);
+    const lineHeight = Math.ceil(fontSize) + 1;
+    let y = cy - (lines.length - 1) * lineHeight / 2;
+    const out: string[] = [];
+    for (const segments of lines) {
+      let t = `    <text x="${cx}" y="${y}" text-anchor="middle" dominant-baseline="middle" fill="${color}" font-size="${fontSize}" font-family="${fontFamily}">`;
+      for (const segment of segments) {
+        const style = this.getSegmentStyle(segment);
+        t += style ? `<tspan${style}>${this.escapeXml(segment.text)}</tspan>` : this.escapeXml(segment.text);
+      }
+      out.push(t + `</text>`);
+      y += lineHeight;
+    }
+    return out.join('\n');
+  }
+
+  //
   // Render a room to SVG.
   //
   private renderRoom(room: Room): string {
@@ -304,7 +436,7 @@ export class SvgExporter {
     // Border
     if (room.lineStyle !== LineStyle.None) {
       const strokeDash = dashArray !== 'none' ? ` stroke-dasharray="${dashArray}"` : '';
-      parts.push(`    <path d="${path}" fill="none" stroke="${room.borderColor}" stroke-width="${room.lineWidth}"${strokeDash}/>`);
+      parts.push(`    <path d="${this.getOutlinePath(room)}" fill="none" stroke="${room.borderColor}" stroke-width="${room.lineWidth}"${strokeDash}/>`);
     }
 
     // Room name with markdown support
@@ -313,12 +445,16 @@ export class SvgExporter {
     const cx = room.x + room.width / 2;
     const cy = room.y + room.height / 2;
 
-    parts.push(this.renderMarkdownText(room.name, cx, cy, fontSize, fontFamily, room.nameColor));
+    const margin = this.map.settings.room.margin || 0;
+    parts.push(this.renderWrappedText(room.name, cx, cy, room.width - margin * 2, fontSize, fontFamily, room.nameColor));
 
-    // Subtitle with markdown support
+    // Subtitle with markdown support, word-wrapped and aligned to the bottom (like the editor)
     if (room.subtitle) {
       const subtitleSize = fontSize * 0.8;
-      parts.push(this.renderMarkdownText(room.subtitle, cx, cy + fontSize, subtitleSize, fontFamily, room.subtitleColor));
+      const lines = this.wrapText(room.subtitle, room.width - margin * 2, subtitleSize).length;
+      const lineHeight = Math.ceil(subtitleSize) + 1;
+      const sy = room.y + room.height - 5 - lineHeight / 2 - (lines - 1) * lineHeight / 2;
+      parts.push(this.renderWrappedText(room.subtitle, cx, sy, room.width - margin * 2, subtitleSize, fontFamily, room.subtitleColor));
     }
 
     parts.push(`  </g>`);
@@ -346,7 +482,7 @@ export class SvgExporter {
     // Border
     if (note.lineStyle !== LineStyle.None) {
       const strokeDash = dashArray !== 'none' ? ` stroke-dasharray="${dashArray}"` : '';
-      parts.push(`    <path d="${path}" fill="none" stroke="${note.borderColor}" stroke-width="${note.lineWidth}"${strokeDash}/>`);
+      parts.push(`    <path d="${this.getOutlinePath(note)}" fill="none" stroke="${note.borderColor}" stroke-width="${note.lineWidth}"${strokeDash}/>`);
     }
 
     // Text with markdown support
@@ -399,7 +535,7 @@ export class SvgExporter {
     // Border
     if (block.lineStyle !== LineStyle.None) {
       const strokeDash = dashArray !== 'none' ? ` stroke-dasharray="${dashArray}"` : '';
-      parts.push(`    <path d="${path}" fill="none" stroke="${block.borderColor}" stroke-width="${block.lineWidth}"${strokeDash}/>`);
+      parts.push(`    <path d="${this.getOutlinePath(block)}" fill="none" stroke="${block.borderColor}" stroke-width="${block.lineWidth}"${strokeDash}/>`);
     }
 
     parts.push(`  </g>`);
@@ -442,60 +578,98 @@ export class SvgExporter {
 
     parts.push(`  <g class="connector">`);
 
-    // Draw connector path
-    let pathD: string;
-    if (conn.isCurve && conn.dockStart && conn.dockEnd) {
-      // Curved connector (cubic Bezier)
-      const stalkLength = 15;
-      const { x: vx1, y: vy1 } = Direction.toVector(startDir);
-      const { x: vx2, y: vy2 } = Direction.toVector(endDir);
+    // Same geometry as ConnectorView: a docked end has a stalk that leaves the
+    // room in its direction; the line (or curve) runs between the stalk ends.
+    const settings = this.map.settings.connector;
+    const stalkEnd = (room: Room, dir: Direction) => {
+      const r = room.directionToPos(dir, true);
+      const v = Direction.toCardinalVector(dir);
+      return { x: r.x + v.x * settings.stalk, y: r.y + v.y * settings.stalk };
+    };
+    const dockStartX = startX, dockStartY = startY, dockEndX = endX, dockEndY = endY;
+    if (conn.dockStart) ({ x: startX, y: startY } = stalkEnd(conn.dockStart, startDir));
+    if (conn.dockEnd) ({ x: endX, y: endY } = stalkEnd(conn.dockEnd, endDir));
 
-      const cp1x = startX + vx1 * stalkLength * 3;
-      const cp1y = startY + vy1 * stalkLength * 3;
-      const cp2x = endX + vx2 * stalkLength * 3;
-      const cp2y = endY + vy2 * stalkLength * 3;
+    // Points along the path, for arrows and labels (fraction t of the way).
+    let pointAt = (t: number) => ({ x: startX + (endX - startX) * t, y: startY + (endY - startY) * t,
+                                     a: Math.atan2(endY - startY, endX - startX) });
 
-      pathD = `M ${startX} ${startY} C ${cp1x} ${cp1y} ${cp2x} ${cp2y} ${endX} ${endY}`;
+    let pathD = conn.dockStart ? `M ${dockStartX} ${dockStartY} L ${startX} ${startY}` : `M ${startX} ${startY}`;
+    // the same path as hand-drawn strokes (used when the map is hand-drawn)
+    const hd: ((dc: DrawContext) => void)[] = [];
+    if (conn.dockStart) hd.push(dc => dc.hdLine(dockStartX, dockStartY, startX, startY));
+    if (conn.isCurve && (conn.dockStart || conn.dockEnd)) {
+      const dist = Math.sqrt((endX - startX) ** 2 + (endY - startY) ** 2) * settings.curveStrength;
+      if (conn.dockStart && conn.dockEnd) {
+        const v1 = Direction.toCardinalVector(startDir), v2 = Direction.toCardinalVector(endDir);
+        const c1x = startX + v1.x * dist, c1y = startY + v1.y * dist;
+        const c2x = endX + v2.x * dist, c2y = endY + v2.y * dist;
+        pathD += ` C ${c1x} ${c1y} ${c2x} ${c2y} ${endX} ${endY}`;
+        hd.push(dc => dc.hdBezier3(startX, startY, c1x, c1y, c2x, c2y, endX, endY));
+        pointAt = (t: number) => {
+          const u = 1 - t;
+          const x = u*u*u*startX + 3*u*u*t*c1x + 3*u*t*t*c2x + t*t*t*endX;
+          const y = u*u*u*startY + 3*u*u*t*c1y + 3*u*t*t*c2y + t*t*t*endY;
+          const dx = 3*u*u*(c1x - startX) + 6*u*t*(c2x - c1x) + 3*t*t*(endX - c2x);
+          const dy = 3*u*u*(c1y - startY) + 6*u*t*(c2y - c1y) + 3*t*t*(endY - c2y);
+          return { x, y, a: Math.atan2(dy, dx) };
+        };
+      } else {
+        const v = Direction.toCardinalVector(conn.dockStart ? startDir : endDir);
+        const cx = (conn.dockStart ? startX : endX) + v.x * dist;
+        const cy = (conn.dockStart ? startY : endY) + v.y * dist;
+        pathD += ` Q ${cx} ${cy} ${endX} ${endY}`;
+        hd.push(dc => dc.hdBezier2(startX, startY, cx, cy, endX, endY));
+        pointAt = (t: number) => {
+          const u = 1 - t;
+          const x = u*u*startX + 2*u*t*cx + t*t*endX;
+          const y = u*u*startY + 2*u*t*cy + t*t*endY;
+          return { x, y, a: Math.atan2(2*u*(cy - startY) + 2*t*(endY - cy), 2*u*(cx - startX) + 2*t*(endX - cx)) };
+        };
+      }
     } else {
-      // Straight connector with stalks
-      const stalkLength = 15;
-      const { x: vx1, y: vy1 } = Direction.toVector(startDir);
-      const { x: vx2, y: vy2 } = Direction.toVector(endDir);
-
-      const stalk1x = startX + vx1 * stalkLength;
-      const stalk1y = startY + vy1 * stalkLength;
-      const stalk2x = endX + vx2 * stalkLength;
-      const stalk2y = endY + vy2 * stalkLength;
-
-      pathD = `M ${startX} ${startY} L ${stalk1x} ${stalk1y} L ${stalk2x} ${stalk2y} L ${endX} ${endY}`;
+      pathD += ` L ${endX} ${endY}`;
+      hd.push(dc => dc.hdLine(startX, startY, endX, endY));
     }
+    if (conn.dockEnd) pathD += ` L ${dockEndX} ${dockEndY}`;
+    if (conn.dockEnd) hd.push(dc => dc.hdLine(endX, endY, dockEndX, dockEndY));
+    if (this.handdrawn) pathD = this.hdPath(conn.id, dockStartX, dockStartY, dc => hd.forEach(f => f(dc)));
 
     const strokeDash = dashArray !== 'none' ? ` stroke-dasharray="${dashArray}"` : '';
     parts.push(`    <path d="${pathD}" fill="none" stroke="${conn.color}" stroke-width="${conn.lineWidth}" stroke-linecap="round" stroke-linejoin="round"${strokeDash}/>`);
 
-    // One-way arrows
-    if (conn.oneWay) {
-      // Draw arrow at 50% along the path
-      const midX = (startX + endX) / 2;
-      const midY = (startY + endY) / 2;
-      const angle = Math.atan2(endY - startY, endX - startX);
+    const p1 = pointAt(0.1), p2 = pointAt(0.9), pc = pointAt(0.5);
 
-      const arrowSize = 8;
-      const arrowPoints = this.getArrowPoints(midX, midY, angle, arrowSize);
-      parts.push(`    <polygon points="${arrowPoints}" fill="${conn.color}"/>`);
+    // One-way arrows, near both ends (as in the editor)
+    if (conn.oneWay) {
+      for (const p of [p1, p2]) {
+        parts.push(`    <polygon points="${this.getArrowPoints(p.x, p.y, p.a, settings.arrowSize)}" fill="${conn.color}"/>`);
+      }
     }
+
+    const fontFamily = this.map.settings.basic.fontFamily;
+    const baseSize = this.map.settings.basic.fontSize;
 
     // Connector name label
     if (conn.name) {
-      const midX = (startX + endX) / 2;
-      const midY = (startY + endY) / 2;
-      const fontSize = this.map.settings.basic.fontSize * 0.7;
-      const fontFamily = this.map.settings.basic.fontFamily;
-      const padding = 4;
-      const textWidth = conn.name.length * fontSize * 0.6;
+      const textWidth = this.textWidth(conn.name, baseSize);
+      parts.push(`    <rect x="${pc.x - textWidth / 2 - 5}" y="${pc.y - 11}" width="${textWidth + 10}" height="20" fill="#fff" stroke="#000" stroke-width="1" rx="3"/>`);
+      parts.push(`    <text x="${pc.x}" y="${pc.y}" text-anchor="middle" dominant-baseline="middle" fill="#333" font-size="${baseSize}" font-family="${fontFamily}">${this.escapeXml(conn.name)}</text>`);
+    }
 
-      parts.push(`    <rect x="${midX - textWidth / 2 - padding}" y="${midY - fontSize / 2 - padding}" width="${textWidth + padding * 2}" height="${fontSize + padding * 2}" fill="white" stroke="black" stroke-width="1" rx="3"/>`);
-      parts.push(`    <text x="${midX}" y="${midY}" text-anchor="middle" dominant-baseline="middle" font-size="${fontSize}" font-family="${fontFamily}">${this.escapeXml(conn.name)}</text>`);
+    // Start and end labels (up/dn/in/out or custom), beside the line near each end
+    const labelSize = baseSize * 0.7;
+    const startText = conn.startLabel ? conn.startLabel : ConnectorType.toString(conn.startType);
+    const endText = conn.endLabel ? conn.endLabel : ConnectorType.toString(conn.endType);
+    if (startText) {
+      const x = p1.x + Math.cos(p1.a - Math.PI / 2) * settings.labelDistance;
+      const y = p1.y + Math.sin(p1.a - Math.PI / 2) * settings.labelDistance;
+      parts.push(`    <text x="${x}" y="${y}" text-anchor="middle" dominant-baseline="middle" fill="${conn.color}" font-size="${labelSize}" font-family="${fontFamily}">${this.escapeXml(startText)}</text>`);
+    }
+    if (endText) {
+      const x = p2.x + Math.cos(p2.a + Math.PI / 2) * settings.labelDistance;
+      const y = p2.y + Math.sin(p2.a + Math.PI / 2) * settings.labelDistance;
+      parts.push(`    <text x="${x}" y="${y}" text-anchor="middle" dominant-baseline="middle" fill="${conn.color}" font-size="${labelSize}" font-family="${fontFamily}">${this.escapeXml(endText)}</text>`);
     }
 
     parts.push(`  </g>`);
@@ -507,12 +681,10 @@ export class SvgExporter {
   // Get arrow polygon points.
   //
   private getArrowPoints(x: number, y: number, angle: number, size: number): string {
-    const points: { x: number, y: number }[] = [
-      { x: x + Math.cos(angle) * size, y: y + Math.sin(angle) * size },
-      { x: x + Math.cos(angle + 2.5) * size, y: y + Math.sin(angle + 2.5) * size },
-      { x: x + Math.cos(angle - 2.5) * size, y: y + Math.sin(angle - 2.5) * size }
-    ];
-    return points.map(p => `${p.x},${p.y}`).join(' ');
+    // Same triangle as ConnectorView.drawArrow: (-s,-s), (-s,s), (s,0), rotated by angle.
+    const c = Math.cos(angle), s = Math.sin(angle);
+    return [[-size, -size], [-size, size], [size, 0]]
+      .map(([px, py]) => `${x + px * c - py * s},${y + px * s + py * c}`).join(' ');
   }
 
   //
